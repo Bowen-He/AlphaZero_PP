@@ -51,9 +51,9 @@ class CumulativeRewardWrapper(gym.Wrapper):
 class BitStringGameGym(gym.Env):
     metadata = {'render.modes': ['human']}
 
-    def __init__(self, nsites=10):
+    def __init__(self, nsites=10, bitflipmode=True, sparsemode=True, nones=2):
         """
-        Every environment should be derived from gym.Env and at least contain the variables observation_space and action_space 
+        Every environment should be derived from gym.Env and at least contain the variables observation_space and action_space
         specifying the type of possible observations and actions using spaces.Box or spaces.Discrete.
 
         Example:
@@ -61,9 +61,9 @@ class BitStringGameGym(gym.Env):
         >>> EnvTest.observation_space=spaces.Box(low=-1, high=1, shape=(3,4))
         >>> EnvTest.action_space=spaces.Discrete(2)
         """
-        self.bitflipmode = True  # "setting" a 1 flips it  back to 0
-        self.sparsemode = True  # score is only given at end of (fixed length?) episode
-        self.nones = 2 # number of bits that are initially set to 1
+        self.bitflipmode = bitflipmode  # "setting" a 1 flips it  back to 0
+        self.sparsemode = sparsemode  # score is only given at end of (fixed length?) episode
+        self.nones = nones # number of bits that are initially set to 1
 
         self.nsites = nsites
         self.max_steps = 2 * nsites if not self.sparsemode else nsites - self.nones
@@ -351,6 +351,9 @@ if __name__ == "__main__":
     # Defaults match the CLASS defaults, not any previous hardcoded run.
     HYPERPARAMS = [
         ("nsites",                      int,   10,    "Number of bits in the bitstring",         "Game",      False),
+        ("bitflipmode",                 bool,  True,  "Flip bit back to 0 if already 1",        "Game",      False),
+        ("sparsemode",                  bool,  True,  "Reward only at episode end",             "Game",      False),
+        ("nones",                       int,   2,     "Bits initially set to 1",                "Game",      False),
         ("n_hidden_layers",             int,   2,     "Number of hidden layers",                 "Network",   False),
         ("hidden_size",                 int,   128,   "Size of hidden layers",                   "Network",   False),
         ("epochs",                      int,   10,    "Training epochs per iteration",           "Training",  False),
@@ -379,6 +382,15 @@ if __name__ == "__main__":
     ]
 
     # ── Helpers ──────────────────────────────────────────────────────────
+    def str_to_bool(value):
+        if isinstance(value, bool):
+            return value
+        if value.lower() in ("true", "1", "yes"):
+            return True
+        if value.lower() in ("false", "0", "no"):
+            return False
+        raise argparse.ArgumentTypeError(f"Expected bool, got '{value}'")
+
     def nullable_int(value):
         if value is None or str(value).lower() == "none":
             return None
@@ -462,7 +474,8 @@ if __name__ == "__main__":
                         print(f"  [!] '{pd['name']}' does not accept None")
                 else:
                     try:
-                        parsed = pd["type"](raw_val)
+                        converter = str_to_bool if pd["type"] is bool else pd["type"]
+                        parsed = converter(raw_val)
                         values[pd["name"]] = parsed
                         print(f"  {pd['name']} = {parsed}")
                     except ValueError:
@@ -477,7 +490,8 @@ if __name__ == "__main__":
     parser.add_argument("--interactive", action="store_true",
                         help="Review and edit hyperparameters interactively before training")
     for pd in PARAM_DEFS:
-        arg_type = (nullable_int if pd["nullable"] and pd["type"] is int
+        arg_type = (str_to_bool if pd["type"] is bool
+                    else nullable_int if pd["nullable"] and pd["type"] is int
                     else nullable_float if pd["nullable"] and pd["type"] is float
                     else pd["type"])
         parser.add_argument(
@@ -537,7 +551,12 @@ if __name__ == "__main__":
     if values["eval_seed"] is not None:
         random_seeds["eval"] = values["eval_seed"]
 
-    mygame = BitStringGame(nsites=values["nsites"])
+    mygame = BitStringGame(
+        nsites=values["nsites"],
+        bitflipmode=values["bitflipmode"],
+        sparsemode=values["sparsemode"],
+        nones=values["nones"],
+    )
     mynet = BitStringPolicyValueNet(
         random_seed=values["random_seed"],
         nsites=values["nsites"],
