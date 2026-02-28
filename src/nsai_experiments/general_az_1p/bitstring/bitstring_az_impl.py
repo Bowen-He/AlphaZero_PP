@@ -221,6 +221,7 @@ class BitStringPolicyValueNet(TorchPolicyValueNet):
 
         train_mini_losses = []
         train_losses = []
+        nan_detected = False
 
         for epoch in range(tp["epochs"]):
             # Training phase
@@ -242,7 +243,13 @@ class BitStringPolicyValueNet(TorchPolicyValueNet):
                 loss_policy = criterion_policy(outputs_policy, targets_policy)
                 loss = loss_value + policy_weight*loss_policy
 
+                if torch.isnan(loss):
+                    warnings.warn(f"NaN loss detected at epoch {epoch+1}, stopping training early")
+                    nan_detected = True
+                    break
+
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
                 loss = loss.item()
                 train_mini_losses.append(loss)
@@ -250,6 +257,8 @@ class BitStringPolicyValueNet(TorchPolicyValueNet):
                 policy_loss += loss_policy
                 value_loss += loss_value
 
+            if nan_detected:
+                break
             train_losses.append(train_loss / len(train_loader))
             if print_all_epochs or epoch == 0 or epoch == tp["epochs"] - 1:
             # if True:
