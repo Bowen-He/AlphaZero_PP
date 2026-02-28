@@ -51,9 +51,9 @@ class CumulativeRewardWrapper(gym.Wrapper):
 class BitStringGameGym(gym.Env):
     metadata = {'render.modes': ['human']}
 
-    def __init__(self, nsites=10):
+    def __init__(self, nsites=10, bitflipmode=True, sparsemode=True, nones=2):
         """
-        Every environment should be derived from gym.Env and at least contain the variables observation_space and action_space 
+        Every environment should be derived from gym.Env and at least contain the variables observation_space and action_space
         specifying the type of possible observations and actions using spaces.Box or spaces.Discrete.
 
         Example:
@@ -61,9 +61,9 @@ class BitStringGameGym(gym.Env):
         >>> EnvTest.observation_space=spaces.Box(low=-1, high=1, shape=(3,4))
         >>> EnvTest.action_space=spaces.Discrete(2)
         """
-        self.bitflipmode = True  # "setting" a 1 flips it  back to 0
-        self.sparsemode = True  # score is only given at end of (fixed length?) episode
-        self.nones = 2 # number of bits that are initially set to 1
+        self.bitflipmode = bitflipmode  # "setting" a 1 flips it  back to 0
+        self.sparsemode = sparsemode  # score is only given at end of (fixed length?) episode
+        self.nones = nones # number of bits that are initially set to 1
 
         self.nsites = nsites
         self.max_steps = 2 * nsites if not self.sparsemode else nsites - self.nones
@@ -221,6 +221,7 @@ class BitStringPolicyValueNet(TorchPolicyValueNet):
 
         train_mini_losses = []
         train_losses = []
+        nan_detected = False
 
         for epoch in range(tp["epochs"]):
             # Training phase
@@ -242,7 +243,13 @@ class BitStringPolicyValueNet(TorchPolicyValueNet):
                 loss_policy = criterion_policy(outputs_policy, targets_policy)
                 loss = loss_value + policy_weight*loss_policy
 
+                if torch.isnan(loss):
+                    warnings.warn(f"NaN loss detected at epoch {epoch+1}, stopping training early")
+                    nan_detected = True
+                    break
+
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
                 loss = loss.item()
                 train_mini_losses.append(loss)
@@ -250,6 +257,8 @@ class BitStringPolicyValueNet(TorchPolicyValueNet):
                 policy_loss += loss_policy
                 value_loss += loss_value
 
+            if nan_detected:
+                break
             train_losses.append(train_loss / len(train_loader))
             if print_all_epochs or epoch == 0 or epoch == tp["epochs"] - 1:
             # if True:
@@ -335,27 +344,236 @@ class BitStringAgent(Agent):
     
 
 if __name__ == "__main__":
+    import argparse
+
+    # ── Hyperparameter registry ──────────────────────────────────────────
+    # Each entry: (name, type, default, description, category, nullable)
+    # Defaults match the CLASS defaults, not any previous hardcoded run.
+    HYPERPARAMS = [
+        ("nsites",                      int,   10,    "Number of bits in the bitstring",         "Game",      False),
+        ("bitflipmode",                 bool,  True,  "Flip bit back to 0 if already 1",        "Game",      False),
+        ("sparsemode",                  bool,  True,  "Reward only at episode end",             "Game",      False),
+        ("nones",                       int,   2,     "Bits initially set to 1",                "Game",      False),
+        ("n_hidden_layers",             int,   2,     "Number of hidden layers",                 "Network",   False),
+        ("hidden_size",                 int,   128,   "Size of hidden layers",                   "Network",   False),
+        ("epochs",                      int,   10,    "Training epochs per iteration",           "Training",  False),
+        ("batch_size",                  int,   32,    "Batch size",                              "Training",  False),
+        ("learning_rate",               float, 0.001, "Learning rate",                           "Training",  False),
+        ("weight_decay",                float, 1e-4,  "L2 regularization",                       "Training",  False),
+        ("policy_weight",               float, 1.0,   "Weight for policy loss vs value loss",    "Training",  False),
+        ("n_games_per_train",           int,   100,   "Games per training iteration",            "Agent",     False),
+        ("n_games_per_eval",            int,   20,    "Games per evaluation",                    "Agent",     False),
+        ("n_past_iterations_to_train",  int,   20,    "Past iterations for training (None=all)", "Agent",     True),
+        ("threshold_to_keep",           float, 0.55,  "Win rate threshold to keep new net",      "Agent",     False),
+        ("reward_discount",             float, 1.0,   "Discount factor for reward propagation",  "Agent",     False),
+        ("n_procs",                     int,   None,  "MP cores (None=all, <0=disabled)",        "Agent",     True),
+        ("n_simulations",               int,   25,    "MCTS simulations per move",               "MCTS",      False),
+        ("temperature",                 float, 1.0,   "Temperature for move selection",          "MCTS",      False),
+        ("c_exploration",               float, 1.0,   "UCB exploration constant",                "MCTS",      False),
+        ("random_seed",                 int,   None,  "Network initialization seed",             "Seeds",     True),
+        ("mcts_seed",                   int,   None,  "MCTS random seed",                        "Seeds",     True),
+        ("train_seed",                  int,   None,  "Training random seed",                    "Seeds",     True),
+        ("eval_seed",                   int,   None,  "Evaluation random seed",                  "Seeds",     True),
+        ("n_iterations",                int,   20,    "Number of AlphaZero iterations",          "Top-level", False),
+    ]
+    PARAM_DEFS = [
+        {"name": p[0], "type": p[1], "default": p[2], "desc": p[3], "category": p[4], "nullable": p[5]}
+        for p in HYPERPARAMS
+    ]
+
+    # ── Helpers ──────────────────────────────────────────────────────────
+    def str_to_bool(value):
+        if isinstance(value, bool):
+            return value
+        if value.lower() in ("true", "1", "yes"):
+            return True
+        if value.lower() in ("false", "0", "no"):
+            return False
+        raise argparse.ArgumentTypeError(f"Expected bool, got '{value}'")
+
+    def nullable_int(value):
+        if value is None or str(value).lower() == "none":
+            return None
+        return int(value)
+
+    def nullable_float(value):
+        if value is None or str(value).lower() == "none":
+            return None
+        return float(value)
+
+    def print_param_table(param_defs, values, title="Hyperparameters"):
+        print()
+        print("=" * 78)
+        print(f"{title:^78}")
+        print("=" * 78)
+        current_category = None
+        idx = 0
+        for pd in param_defs:
+            if pd["category"] != current_category:
+                current_category = pd["category"]
+                print(f"\n  {current_category}")
+                print(f"  {'-' * len(current_category)}")
+                print(f"  {'#':>3}  {'Name':<30} {'Value':>10}  {'Type':<7} Description")
+            idx += 1
+            val = values[pd["name"]]
+            val_str = str(val) if val is not None else "None"
+            type_str = pd["type"].__name__
+            if pd["nullable"]:
+                type_str += "?"
+            print(f"  {idx:>3}  {pd['name']:<30} {val_str:>10}  {type_str:<7} {pd['desc']}")
+        print()
+
+    def interactive_prompt(param_defs, values):
+        import sys
+        name_to_idx = {pd["name"]: i for i, pd in enumerate(param_defs)}
+        print("Commands:")
+        print("  number=value   Set by row number (e.g. 1=20)")
+        print("  name=value     Set by name (e.g. learning_rate=0.01)")
+        print("  show           Reprint the table")
+        print("  run            Start training with current settings")
+        print("  quit           Exit without training")
+        print()
+        while True:
+            try:
+                sys.stdout.flush()
+                line = input("> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\nAborted.")
+                sys.exit(0)
+            if not line:
+                continue
+            if line.lower() in ("run", "r"):
+                return values
+            if line.lower() in ("quit", "q"):
+                print("Exiting.")
+                sys.exit(0)
+            if line.lower() == "show":
+                print_param_table(param_defs, values, title="AlphaZero Bitstring - Current Configuration")
+                continue
+            for token in line.split():
+                if "=" not in token:
+                    print(f"  [!] Invalid format: '{token}' (expected 'key=value')")
+                    continue
+                key, _, raw_val = token.partition("=")
+                if key.isdigit():
+                    idx = int(key) - 1
+                    if idx < 0 or idx >= len(param_defs):
+                        print(f"  [!] Index {key} out of range (1-{len(param_defs)})")
+                        continue
+                else:
+                    if key not in name_to_idx:
+                        print(f"  [!] Unknown parameter: '{key}'")
+                        continue
+                    idx = name_to_idx[key]
+                pd = param_defs[idx]
+                if raw_val.lower() == "none":
+                    if pd["nullable"]:
+                        values[pd["name"]] = None
+                        print(f"  {pd['name']} = None")
+                    else:
+                        print(f"  [!] '{pd['name']}' does not accept None")
+                else:
+                    try:
+                        converter = str_to_bool if pd["type"] is bool else pd["type"]
+                        parsed = converter(raw_val)
+                        values[pd["name"]] = parsed
+                        print(f"  {pd['name']} = {parsed}")
+                    except ValueError:
+                        print(f"  [!] Cannot parse '{raw_val}' as {pd['type'].__name__}")
+        return values
+
+    # ── Argparse ─────────────────────────────────────────────────────────
+    parser = argparse.ArgumentParser(
+        description="AlphaZero training for the Bitstring game",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--interactive", action="store_true",
+                        help="Review and edit hyperparameters interactively before training")
+    for pd in PARAM_DEFS:
+        arg_type = (str_to_bool if pd["type"] is bool
+                    else nullable_int if pd["nullable"] and pd["type"] is int
+                    else nullable_float if pd["nullable"] and pd["type"] is float
+                    else pd["type"])
+        parser.add_argument(
+            f"--{pd['name']}",
+            type=arg_type,
+            default=pd["default"],
+            help=f"{pd['desc']} (default: {pd['default']})",
+        )
+    args = parser.parse_args()
+
+    # ── Collect values ───────────────────────────────────────────────────
+    values = {pd["name"]: getattr(args, pd["name"]) for pd in PARAM_DEFS}
+
+    if args.interactive:
+        print_param_table(PARAM_DEFS, values, title="AlphaZero Bitstring - Current Configuration")
+        values = interactive_prompt(PARAM_DEFS, values)
+
+    print_param_table(PARAM_DEFS, values, title="AlphaZero Bitstring - Final Configuration")
+
+    import sys
+    try:
+        confirm = input("Press Enter to start training (q to quit): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\nAborted.")
+        sys.exit(0)
+    if confirm.lower() in ("q", "quit"):
+        print("Exiting.")
+        sys.exit(0)
+
+    # ── Setup and run ────────────────────────────────────────────────────
     from nsai_experiments.general_az_1p.setup_utils import disable_numpy_multithreading, use_deterministic_cuda
     disable_numpy_multithreading()
     use_deterministic_cuda()
 
     import numpy as np
-
     from nsai_experiments.general_az_1p.agent import Agent
-
     from nsai_experiments.general_az_1p.bitstring.bitstring_az_impl import BitStringGame
     from nsai_experiments.general_az_1p.bitstring.bitstring_az_impl import BitStringPolicyValueNet
 
-    nsites = 10  # Number of bits in the bitstring
-    mygame = BitStringGame(nsites = nsites)
-    # mynet = CartPolePolicyValueNet(random_seed=47, training_params={"epochs": 10, "learning_rate": 0.01, "policy_weight": 4.0})
-    mynet = BitStringPolicyValueNet(random_seed=47, nsites=nsites, n_hidden_layers=1, training_params={"epochs": 5, "learning_rate": 1e-2, "policy_weight": 2.0})
-    # myagent = Agent(mygame, mynet, random_seeds={"mcts": 48, "train": 49, "eval": 50}, threshold_to_keep=-1.0, n_games_per_eval=1, mcts_params={"n_simulations": 5})
-    # myagent = Agent(mygame, mynet, random_seeds={"mcts": 48, "train": 49, "eval": 50}, threshold_to_keep=-1.0, n_procs=-1)
-    # myagent = Agent(mygame, mynet, random_seeds={"mcts": 48, "train": 49, "eval": 50}, threshold_to_keep=-1.0)
-#    myagent = BitStringAgent(mygame, mynet, n_procs=-1, n_games_per_train=50, n_games_per_eval=10, random_seeds={"mcts": 48, "train": 49, "eval": 50}, mcts_params={"c_exploration": 1})
-    myagent = Agent(mygame, mynet, n_games_per_train=100, n_games_per_eval=10, threshold_to_keep=0.4,  n_past_iterations_to_train=5,
-                    random_seeds={"mcts": 48, "train": 49, "eval": 50}, mcts_params={"n_simulations": 30, "c_exploration": 0.4})
+    training_params = {
+        "epochs": values["epochs"],
+        "batch_size": values["batch_size"],
+        "learning_rate": values["learning_rate"],
+        "weight_decay": values["weight_decay"],
+        "policy_weight": values["policy_weight"],
+    }
+    mcts_params = {
+        "n_simulations": values["n_simulations"],
+        "temperature": values["temperature"],
+        "c_exploration": values["c_exploration"],
+    }
+    random_seeds = {}
+    if values["mcts_seed"] is not None:
+        random_seeds["mcts"] = values["mcts_seed"]
+    if values["train_seed"] is not None:
+        random_seeds["train"] = values["train_seed"]
+    if values["eval_seed"] is not None:
+        random_seeds["eval"] = values["eval_seed"]
 
+    mygame = BitStringGame(
+        nsites=values["nsites"],
+        bitflipmode=values["bitflipmode"],
+        sparsemode=values["sparsemode"],
+        nones=values["nones"],
+    )
+    mynet = BitStringPolicyValueNet(
+        random_seed=values["random_seed"],
+        nsites=values["nsites"],
+        n_hidden_layers=values["n_hidden_layers"],
+        hidden_size=values["hidden_size"],
+        training_params=training_params,
+    )
+    myagent = Agent(
+        mygame, mynet,
+        n_games_per_train=values["n_games_per_train"],
+        n_games_per_eval=values["n_games_per_eval"],
+        n_past_iterations_to_train=values["n_past_iterations_to_train"],
+        threshold_to_keep=values["threshold_to_keep"],
+        reward_discount=values["reward_discount"],
+        mcts_params=mcts_params,
+        n_procs=values["n_procs"],
+        random_seeds=random_seeds if random_seeds else None,
+    )
 
-    myagent.play_train_multiple(100)    
+    myagent.play_train_multiple(values["n_iterations"])

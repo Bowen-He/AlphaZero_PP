@@ -158,8 +158,8 @@ class MCTS():
         if sum_policy > 0:
             mypolicy /= sum_policy
         else:
-            warnings.warn("All valid moves have zero probability, ignoring probabilities")
-            mypolicy += myaction_mask / sum_mask
+            warnings.warn("Network produced NaN or all-zero probabilities, substituting uniform distribution")
+            mypolicy = myaction_mask / sum_mask
 
         return mypolicy, myvalue, myaction_mask
     
