@@ -75,8 +75,9 @@ def extract_best_program(leaf_eval):
     if not leaf_eval._cache:
         return None, None, None, float("-inf")
     best_key = max(leaf_eval._cache, key=leaf_eval._cache.get)
+    display_key = leaf_eval._surface_labels.get(best_key, best_key)
     return (
-        best_key,
+        display_key,
         leaf_eval._program_cache[best_key],
         leaf_eval._full_cache[best_key],
         leaf_eval._cache[best_key],
