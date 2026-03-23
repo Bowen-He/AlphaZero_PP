@@ -43,23 +43,42 @@ class MultiprocessingManager:
     def starmap(fn, arg_tuples, n_procs=None):
         """
         Execute function across multiple processes or sequentially.
-        
+
         Args:
             fn: Function to execute
             arg_tuples: Iterable of argument tuples to pass to fn
             n_procs: Number of processes (None=all cores, <0=no multiprocessing)
-        
+
         Returns:
             List of results from fn(*args) for each args in arg_tuples
         """
-        ctx = get_context("spawn")  # Use 'spawn' to avoid issues with forking in some environments
-        if n_procs is None or n_procs >= 0:
-            # Suppress macOS MallocStackLogging warnings in spawned child processes
-            if platform.system() == "Darwin":
-                os.environ.pop("MallocStackLogging", None)
+        if n_procs is not None and n_procs < 0:
+            results = list(itertools.starmap(fn, arg_tuples))
+            return results
+
+        # Try spawn first (safe with CUDA), fall back to forkserver/fork
+        # if spawn fails (e.g., running from stdin or interactive shell)
+        for method in ("spawn", "forkserver", "fork"):
+            try:
+                ctx = get_context(method)
+                break
+            except ValueError:
+                continue
+
+        # Suppress macOS MallocStackLogging warnings in spawned child processes
+        if platform.system() == "Darwin":
+            os.environ.pop("MallocStackLogging", None)
+
+        try:
             with ctx.Pool(processes=n_procs) as pool:
                 results = pool.starmap(fn, arg_tuples)
-        else:
+        except (FileNotFoundError, RuntimeError) as e:
+            # spawn context fails when main module is <stdin> or non-file
+            # Fall back to sequential execution
+            warnings.warn(
+                f"Multiprocessing failed ({e}), falling back to sequential. "
+                f"Run from a script file for parallel execution."
+            )
             results = list(itertools.starmap(fn, arg_tuples))
         return results
 
