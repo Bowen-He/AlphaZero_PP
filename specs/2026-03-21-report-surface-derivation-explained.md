@@ -197,6 +197,22 @@ column shows what raw AST nodes it becomes after compilation.
 | `MoveToKey(k)` | move to key k's location | `Flip(key_loc[k])` |
 | `MoveToGoal` | move to goal location | `Flip(goal_loc)` |
 
+**What is `goal_loc`?**  The goal location is always the *last* location in the layout:
+`goal_loc = M − 1 = 2D − 1`.  It sits in the final room — the room the agent must
+ultimately reach.
+
+| D | M (locations) | goal_loc | Physical meaning |
+|---|---|---|---|
+| 2 | 4 | 3 | last location in room 1 |
+| 3 | 6 | 5 | last location in room 2 |
+| 4 | 8 | 7 | last location in room 3 |
+
+`MoveToGoal` compiles to `Flip(goal_loc)`, which is the `MOVE_TO` environment action
+targeting that location.  For D=2, `MoveToGoal` → `Flip(3)` = `MOVE_TO(location 3)`.
+For D=3, `MoveToGoal` → `Flip(5)` = `MOVE_TO(location 5)`.  This value is computed in
+`DoorsGameConfig.__post_init__()` as `self.goal_loc = len(self.loc_room) − 1`
+(see `doors_config.py`).
+
 **Concrete example (D=2):**
 - `Pick(0)` → `Flip(4)` (action index 4 = PICK key 0)
 - `MoveToKey(0)` → `Flip(1)` (action index 1 = MOVE to location 1)
@@ -373,6 +389,151 @@ The tree is right-leaning: the left child of each Ite is shallow (condition + ac
 the right child (else-branch) contains the entire rest of the chain.  This shape is
 characteristic of decision lists / if-elif-else chains.
 
+### 4.5a  Compiler internals: from surface atoms to raw AST
+
+The step-by-step examples above show the *output* of compilation.  This section explains
+the *code* that produces it — which functions are called, how they resolve domain-aware
+names to raw observation indices, and how the project's three compiler layers relate.
+
+#### The three-layer compiler architecture
+
+The project implements three DSL layers.  Each adds progressively more abstraction on top
+of the same raw AST target:
+
+```
+Layer 1 — Surface compiler (surface_compiler.py)
+  Input:  SurfacePolicy (flat rule sequence)
+  Output: Program (Ite / Default tree)
+  Resolves: typed condition/action names → raw IsZero/Flip indices
+
+Layer 2 — Stage compiler (stage_compiler.py)
+  Input:  StageProgram (stages with guard combinators Not/And)
+  Output: Program
+  Resolves: guard combinators → nested AST condition trees
+  Delegates surface atoms to Layer 1
+
+Layer 3 — Lifted compiler (lifted_compiler.py)
+  Input:  LiftedPolicy (abstract selectors like CurrentRoom, KeyFor)
+  Output: Program
+  Resolves: ForEachLockedRoom loop → concrete per-key stages
+  Delegates everything else to the relational runtime (DoorsRelationalRuntime)
+```
+
+All three layers produce the **same `Program` type** (`Ite | Default` from `ast_nodes.py`),
+so the interpreter, leaf evaluator, and all downstream tooling work identically regardless
+of which compiler produced the tree.
+
+#### Code walkthrough: the surface compiler
+
+The surface compiler (`surface_compiler.py`) has three public functions:
+
+```python
+def compile_condition(cond: SurfaceCondition, cfg: DoorsGameConfig) -> Condition
+def compile_action(act: SurfaceAction, cfg: DoorsGameConfig) -> Flip
+def compile_policy(policy: SurfacePolicy, cfg: DoorsGameConfig) -> Program
+```
+
+**`compile_condition`** is a pattern match over the five condition types.  Each branch
+translates a domain name into raw observation indices using `cfg`:
+
+```
+AtKeyLoc(k)   → Not(IsZero(cfg.key_loc[k]))         # obs[key_loc[k]] != 0
+KeyAvail(k)   → Not(IsZero(cfg.M + cfg.D + k))       # obs[M+D+k] != 0
+RoomLocked(r) → IsZero(cfg.M + r)                     # obs[M+r] == 0
+PickReady(k)  → And(compile(AtKeyLoc(k)), compile(KeyAvail(k)))
+NeedKey(k)    → IsZero(cfg.M + cfg.key_unlocks[k])    # obs[M+unlocks[k]] == 0
+```
+
+The key insight is that **every index comes from `DoorsGameConfig`**, never from a
+hard-coded constant.  The same compiler works for any D as long as `cfg` is set up
+correctly.
+
+**`compile_action`** maps the three action types to environment action indices:
+
+```
+Pick(k)      → Flip(cfg.M + k)           # action M+k = PICK(key k)
+MoveToKey(k) → Flip(cfg.key_loc[k])      # action key_loc[k] = MOVE_TO(key location)
+MoveToGoal() → Flip(cfg.goal_loc)        # action goal_loc = MOVE_TO(goal)
+```
+
+**`compile_policy`** chains rules right-to-left (as described in Section 4.5):
+
+```python
+prog = Default(compile_action(GoalRule.action, cfg))   # innermost
+for rule in reversed(policy.rules[:-1]):               # wrap outward
+    cond = compile_condition(rule.condition, cfg)
+    act  = compile_action(rule.action, cfg)
+    prog = Ite(cond, act, prog)
+return prog
+```
+
+#### The stage compiler: adding guard combinators
+
+The stage compiler (`stage_compiler.py`) extends the surface vocabulary with boolean
+combinators `GuardNot` and `GuardAnd`, allowing complex guard expressions like
+`GuardAnd(PickReady(0), GuardNot(RoomLocked(1)))`.
+
+Its key function `compile_guard` is recursive:
+
+```python
+def compile_guard(guard: GuardExpr, cfg: DoorsGameConfig) -> Condition:
+    if isinstance(guard, GuardNot):
+        return AstNot(compile_guard(guard.child, cfg))
+    if isinstance(guard, GuardAnd):
+        return AstAnd(compile_guard(guard.left, cfg), compile_guard(guard.right, cfg))
+    # base case: a surface condition atom
+    return compile_condition(guard, cfg)   # delegates to surface compiler
+```
+
+`compile_stage_program` assembles the full tree using the same right-fold pattern:
+
+```python
+def compile_stage_program(prog: StageProgram, cfg: DoorsGameConfig) -> Program:
+    result = Default(compile_action(prog.default_action, cfg))
+    for stage in reversed(prog.stages):
+        cond = compile_guard(stage.guard, cfg)
+        act  = compile_action(stage.action, cfg)
+        result = Ite(cond, act, result)
+    return result
+```
+
+The stage compiler **reuses** `compile_condition` and `compile_action` from the surface
+compiler for all leaf-level atoms.  It only adds the recursive combinator handling on top.
+
+#### The lifted compiler: D-independent programs
+
+The lifted compiler (`lifted_compiler.py`) introduces **abstract selectors** — symbolic
+references like `CurrentRoom` and `KeyFor(CurrentRoom)` that are not tied to any specific
+key index.  A single lifted program works for *any* D.
+
+The compilation uses `DoorsRelationalRuntime` (from `relational_runtime.py`) to expand
+abstract queries at compile time:
+
+```python
+def compile_lifted_policy(policy: LiftedPolicy, rt: DoorsRelationalRuntime) -> Program:
+    prog = Default(rt.flip_move_to_goal())
+    for r in reversed(rt.lockable_rooms()):          # rooms 1..D-1
+        k = rt.key_for_room(r)                        # resolve CurrentRoom → key index
+        for rule in reversed(policy.body.rules):
+            cond   = _compile_predicate(rule.predicate, rt, k)
+            action = _compile_action(rule.action, rt, k)
+            prog = Ite(cond, action, prog)
+    return prog
+```
+
+The critical difference from the surface/stage compilers: the lifted compiler **never**
+accesses `cfg.key_loc` or `cfg.key_unlocks` directly.  All index resolution goes through
+`DoorsRelationalRuntime`, which supports both `known_map=True` (key locations available)
+and `known_map=False` (locations unknown).
+
+#### Summary: what each compiler adds
+
+| Compiler | Extra capability over previous layer | Delegates to |
+|---|---|---|
+| Surface | Typed conditions/actions → raw AST indices | `DoorsGameConfig` |
+| Stage | Guard combinators (`Not`, `And`) | Surface compiler for atoms |
+| Lifted | Abstract selectors, D-independence | `DoorsRelationalRuntime` |
+
 ### 4.6  Key insight: sequential search, compiled tree
 
 In the **original** budget-grammar derivation game, the search state *is* the partial AST
@@ -478,6 +639,36 @@ Fixed-length vector of shape `(2 × (2K+1),)` containing `(type_id, param)` pair
 | MoveRule(k) | 2 | k |
 | GoalRule | 3 | 0 |
 
+### 5.6  Observability properties
+
+The derivation-game agent has **full observability** of its own construction history.
+Several properties are worth highlighting:
+
+1. **Complete construction visibility.**  The observation encodes every rule placed so
+   far as `(type_id, param)` pairs.  The agent sees the exact sequence it has built —
+   there is no hidden state in the derivation game itself.
+
+2. **Flat, fixed-length representation.**  The observation is a flat vector of
+   `2 × (2K+1)` integers, not a tree or graph.  This makes it directly consumable by
+   standard neural network architectures (fully connected or transformer) without
+   requiring tree-structured encoders.
+
+3. **Implicit remaining-action inference.**  Because the agent knows which rules it has
+   placed (from the observation) and what the full rule set is (from the game definition),
+   it can infer which rules remain to be placed and which are currently legal.  The legal
+   mask (Section 5.3) is a deterministic function of the observation.
+
+4. **No Doors-environment observation.**  The derivation-game agent never sees the Doors
+   environment's observation vector (agent location, room status, key availability).  It
+   only observes its own construction choices.  The Doors environment is invisible during
+   search — it appears only at terminal evaluation, when the completed policy is compiled
+   and executed to compute the reward.
+
+This is a fundamentally different observability regime from the Doors environment itself,
+where the agent has partial information about locked rooms and key locations.  The
+derivation game is a **fully observable** meta-game over **program construction**, even
+though the object-level game may be partially observable.
+
 ---
 
 ## 6  The Relaxed Grammar
@@ -521,6 +712,38 @@ PickRule(1) >> PickRule(0) >> MoveRule(0) >> MoveRule(1) >> GoalRule   (pick key
 
 $$\text{Relaxed policies} = \frac{(2K)!}{2^K}$$
 
+**Worked example for D=3 (K=2).**
+
+The rule pool is `{P0, M0, P1, M1}` (using P for PickRule, M for MoveRule).
+
+*Step 1:* All unconstrained orderings of 4 items: `(2K)! = 4! = 24`.
+
+*Step 2:* Apply the monotonicity constraint `P(k)` before `M(k)` for each key k:
+- For k=0: exactly half of the 24 orderings have P0 before M0 (by symmetry of swapping
+  P0↔M0).  That keeps 12, eliminates 12.
+- For k=1: of the remaining 12, exactly half have P1 before M1 (the two constraints are
+  independent).  That keeps 6, eliminates 6.
+
+Result: `24 / 2² = 24 / 4 = 6` valid relaxed policies.  These 6 are listed explicitly
+in Section 8.3.
+
+**How solving policies are computed.**
+
+Each relaxed policy is tested against the Doors environment:
+
+1. **Compile:** `compile_policy(policy, cfg)` translates the surface rule sequence into a
+   raw AST program (a nested `Ite`/`Default` tree).
+2. **Execute:** `run_policy_episode(env, prog, x0, is_solved)` runs the compiled program
+   on the Doors environment from the canonical initial state, stepping until the horizon.
+3. **Check:** A policy "solves" if the agent reaches `goal_loc` within the horizon.
+
+This is implemented in `surface_grammar.py`'s `count_solving_policies()` function.
+
+**There is not just one solving policy.**  For D=3, **3 out of 6** relaxed policies solve
+the environment (policies #1, #2, and #4 in Section 8.3).  The common pattern: a policy
+solves if and only if `MoveRule(0)` appears before `MoveRule(1)` — see Section 8.7 for
+why.
+
 **Not all relaxed policies solve the environment.** The ordering determines which "else"
 branch fires first, and a badly ordered policy can attempt to move through a locked room
 forever.
@@ -534,6 +757,37 @@ forever.
 | 3 | 2 | 6 | 3 | 50% |
 | 4 | 3 | 90 | 15 | 17% |
 | 5 | 4 | 2,520 | 105 | 4.2% |
+
+### 6.3a  Comparison with the budget grammar
+
+The budget grammar (`budget_grammar.py`) generates all syntactically valid AST programs
+up to a node budget.  For comparison:
+
+| D | K | n_sites | Budget (~1.5× optimal) | Budget-grammar programs (approx) | Surface relaxed policies | Reduction factor |
+|---|---|---|---|---|---|---|
+| 2 | 1 | 7 | ~18 | ~5,000,000 | 1 | ~5 × 10⁶ |
+| 3 | 2 | 11 | ~34 | ~52,000,000,000 | 6 | ~10¹⁰ |
+
+At D=2, the budget grammar produces approximately **5 million** canonical programs; the
+surface grammar produces exactly **1** policy.  At D=3, the budget grammar produces
+approximately **52 billion** canonical programs; the surface grammar produces exactly
+**6** relaxed policies — a reduction of roughly 10 orders of magnitude.
+
+The surface grammar achieves this reduction by encoding three kinds of domain knowledge
+that the budget grammar lacks:
+
+1. **Typed conditions:** Only semantically meaningful predicates (`PickReady`, `NeedKey`)
+   are expressible, vs. arbitrary `IsZero`/`Not`/`And` combinations over all `n_sites`
+   observation indices.
+2. **Paired condition-action bundles:** Each rule pairs the correct condition with the
+   correct action (e.g., `PickReady(k)` → `Pick(k)`), eliminating all semantically
+   invalid pairings.
+3. **Structural constraint:** The decision list always has exactly 2K+1 rules in a fixed
+   if-elif-else shape, eliminating budget-distribution choices.
+
+The cost of this reduction is **domain knowledge**: the surface DSL requires a human to
+define the rule templates.  Section 14.2 discusses what this design does not capture, and
+Section 12 analyses what domain knowledge is implicitly hardcoded ("cheats").
 
 ### 6.4  Complexity of the search problem
 
@@ -622,6 +876,18 @@ else:
 ```
 
 ### 7.4  Behavioural trace
+
+A **behavioural trace** (also called an **execution trace** or **program trace** in the
+program synthesis literature) is a step-by-step execution log of the compiled program
+running on the Doors environment.  For each timestep it shows:
+
+1. Which rule conditions are evaluated (top to bottom in the decision list).
+2. Which condition evaluates to true (the "firing" rule), or whether the default fires.
+3. What environment action is taken as a result.
+4. The resulting observation (state change).
+
+In the codebase, the `_trace_rules()` function in `interpreter.py` generates these traces
+programmatically.  The traces below are formatted by hand to match the same structure.
 
 ```
 Initial obs: [1, 0, 0, 0,  1, 0,  1]
@@ -719,6 +985,8 @@ else:
 ```
 
 ### 8.6  Behavioural trace
+
+(See Section 7.4 for definition of "behavioural trace".)
 
 ```
 Initial: [1,0,0,0,0,0,  1,0,0,  1,1]
@@ -887,12 +1155,142 @@ comparison to isolate learning's contribution.
 
 ---
 
-## 12  Connection to the Literature
+## 12  Implicit Domain Knowledge ("Cheats") and the Case for Reactive Grammars
+
+The surface DSL achieves its dramatic search-space reduction (Section 6.3a) by embedding
+substantial domain knowledge into the rule templates.  This section makes that knowledge
+explicit, explains why it limits the surface DSL's applicability, and motivates the
+reactive sketch grammar as a step toward a more general formulation.
+
+### 12.1  What is hardcoded in the surface DSL
+
+Each surface rule bundles a **condition** and an **action** into an opaque macro.  The
+agent's only degree of freedom is the ordering of these macros.  Specifically:
+
+| Rule | Hardcoded condition | Hardcoded action | What the agent never discovers |
+|---|---|---|---|
+| `PickRule(k)` | `PickReady(k)` = at key location AND key available | `Pick(k)` | "I should pick keys" and "I need to be at the key's location first" |
+| `MoveRule(k)` | `NeedKey(k)` = the room key k unlocks is locked | `MoveToKey(k)` | "I should move toward needed keys" and "locked rooms require keys" |
+| `GoalRule` | (unconditional) | `MoveToGoal` | "After unlocking all rooms, go to the goal" |
+
+**The search is reduced to ordering only — the WHAT (which conditions to test, which
+actions to pair with them) is fully provided by domain experts.**
+
+Additionally, the **compiler** resolves observation and action indices at compile time.
+For example, `MoveToKey(0)` compiles to `Flip(cfg.key_loc[0])` — the literal index of
+key 0's location.  This requires `cfg.key_loc` to be known, which is only true when
+`known_map=True` (the agent has a complete map of the environment).
+
+### 12.2  Why this matters: the `known_map=False` barrier
+
+In a `known_map=False` (partial observability) setting, `cfg.key_loc[k]` is unknown at
+compile time — the agent must discover key locations during execution.
+
+**Concrete example (D=2, `known_map=False`):**
+
+The surface DSL's `MoveToKey(0)` compiles to `Flip(key_loc[0])`.  But if the agent does
+not know the map, `key_loc[0]` is not available at compile time.  The compiler cannot
+produce a valid `Flip` instruction because it does not know which location to target.
+
+```
+Surface compilation (known_map=True):
+  MoveToKey(0) → Flip(cfg.key_loc[0]) → Flip(1)     ✓ concrete action index
+
+Surface compilation (known_map=False):
+  MoveToKey(0) → Flip(???)                            ✗ key_loc[0] unknown
+```
+
+This is not a minor limitation — it means the entire surface DSL framework is restricted
+to environments where the map is fully known before execution begins.
+
+### 12.3  How the reactive sketch addresses this
+
+The reactive sketch DSL (`reactive_sketch_dsl.py`) uses **lifted selectors** instead of
+concrete indices:
+
+| Surface DSL (grounded) | Reactive Sketch (lifted) |
+|---|---|
+| `MoveToKey(0)` → `Flip(key_loc[0])` | `GoTo(LocOf(KeyFor(NextLockedRoom)))` |
+| `PickReady(0)` → `And(Not(IsZero(1)), Not(IsZero(6)))` | `Pickable(KeyFor(NextLockedRoom))` |
+| `NeedKey(0)` → `IsZero(5)` | implicit in `NextLockedRoom` selector |
+
+The key differences:
+
+1. **D-independence:** The same reactive sketch program works for any D.  The selector
+   `NextLockedRoom` resolves at tick time to whichever room is currently the first locked
+   room.  No key indices appear in the program text.
+
+2. **Tick-time resolution:** Predicates like `KnownLoc(key)` are evaluated against the
+   *current* observation at each timestep via a `ReactiveContext`, not compiled to fixed
+   AST nodes.  This enables handling `known_map=False` via a memory module that tracks
+   discovered key locations.
+
+3. **Fixed search space:** The reactive sketch has exactly 4! = 24 candidate branch
+   orderings regardless of D, compared to the surface DSL's `(2K)!/2^K` which grows
+   super-exponentially.
+
+### 12.4  The reactive sketch's own limitations
+
+The reactive sketch improves on the surface DSL but still embeds significant domain
+knowledge:
+
+- **Fixed branch schemas:** The 4 branches (pick-if-ready, goto-key, goto-goal,
+  explore-frontier) are hardcoded.  The agent chooses only their priority ordering.
+- **Fixed predicates and actions:** Each branch pairs a specific predicate with a specific
+  action.  The agent never discovers *what* to check or *what* to do — only *when*
+  (priority order).
+- **4 branches only:** The structure assumes exactly 4 strategic behaviours are needed.
+  An environment requiring a 5th behaviour cannot be expressed.
+
+In this sense, the reactive sketch is "cheating" in the same way as the surface DSL —
+just with different, more general cheats (lifted selectors instead of grounded indices).
+
+### 12.5  The desideratum: compositional grammars
+
+The ultimate goal is a grammar where the agent discovers **both** what to check and what
+to do — not just the ordering.  This requires:
+
+1. A **predicate catalog** enumerating all meaningful conditions (e.g., `AtKeyLoc(k)`,
+   `KeyAvail(k)`, `RoomLocked(r)`, `GoalReached`, ...).
+2. An **action catalog** enumerating all meaningful actions (e.g., `Pick(k)`,
+   `MoveToKey(k)`, `MoveToGoal`, `Noop`, ...).
+3. A **compositional rule grammar** where each branch is composed by selecting one
+   predicate and one action from their respective catalogs.
+
+For a D=3 Doors instance, the predicate catalog has ~50 entries and the action catalog
+has ~30 entries, giving ~1,500 possible branches per rule slot.  With 2K+1 = 5 rule
+slots, the search space is approximately 1,500⁵ ≈ 7.6 × 10¹⁵ programs — far larger than
+the surface DSL's 6 but far smaller than the budget grammar's ~52 billion, and every
+program is semantically well-typed.
+
+This compositional grammar would:
+- Preserve the surface DSL's semantic well-typedness (no junk programs).
+- Allow the agent to discover condition-action pairings, not just orderings.
+- Support `known_map=False` if the predicate catalog includes observability-aware
+  predicates (e.g., `KnownLoc(k)`, `Explored(r)`).
+
+### 12.6  Summary: the spectrum of domain knowledge
+
+| Grammar | What the agent discovers | What is hardcoded | Search space (D=3) |
+|---|---|---|---|
+| Budget grammar | Everything (conditions, actions, tree structure) | AST node types only | ~52 × 10⁹ |
+| **Surface DSL** | Ordering of pre-built rules | Conditions, actions, rule structure | 6 |
+| Reactive sketch | Ordering of pre-built branches | Branch schemas, predicates, actions | 24 |
+| Compositional (future) | Condition-action pairings + ordering | Predicate/action catalogs, rule structure | ~10¹⁵ |
+
+Each step along this spectrum trades domain knowledge for generality.  The surface DSL
+and reactive sketch demonstrate that aggressive domain encoding enables tractable search,
+but they also reveal the cost: the agent cannot transfer to settings where the hardcoded
+assumptions break (e.g., `known_map=False` for the surface DSL).
+
+---
+
+## 13  Connection to the Literature
 
 The surface derivation design draws on several established ideas.  This section positions it
 relative to the relevant literature.
 
-### 12.1  Decision lists (Rivest, 1987)
+### 13.1  Decision lists (Rivest, 1987)
 
 The compiled output of the surface DSL is exactly a **decision list** in the sense of
 Rivest (1987, "Learning decision lists"): an ordered sequence of (condition, action) pairs
@@ -909,7 +1307,7 @@ The key difference is that classical decision-list learning searches over indivi
 conditions (often from a fixed attribute set), while our surface DSL **fixes the condition
 templates** (PickReady, NeedKey) and searches only over their **ordering**.
 
-### 12.2  Syntax-guided synthesis (SyGuS)
+### 13.2  Syntax-guided synthesis (SyGuS)
 
 The original budget-grammar derivation game is a form of **syntax-guided synthesis**
 (Alur et al., 2013, "Syntax-Guided Synthesis").  In SyGuS, a context-free grammar defines
@@ -927,7 +1325,7 @@ skeleton and the synthesiser fills in the holes.
 In our case, the "sketch" is implicit: every policy has the same structure (2K+1 rules
 ending with GoalRule); the only free variable is the ordering.
 
-### 12.3  Macro-actions and options
+### 13.3  Macro-actions and options
 
 `PickRule(k)` and `MoveRule(k)` are **macro-actions** that bundle a condition test and an
 environment action into one reusable unit.  This is conceptually related to:
@@ -944,7 +1342,7 @@ The budget-grammar's `doors_macros.py` already introduced PickRule/MoveRule as m
 *productions* within the CFG.  The surface DSL takes this further by making macros the
 *only* search actions, eliminating the raw grammar entirely during search.
 
-### 12.4  Domain-specific languages for synthesis
+### 13.4  Domain-specific languages for synthesis
 
 The surface DSL is a **domain-specific language (DSL)** in the tradition of:
 
@@ -958,7 +1356,7 @@ knowledge into the language (conditions test meaningful predicates, actions corr
 real environment operations), the fraction of semantically valid programs rises from < 1%
 (generic grammar) to 50–100% (surface DSL).
 
-### 12.5  AlphaZero for combinatorial optimisation
+### 13.5  AlphaZero for combinatorial optimisation
 
 Using AlphaZero (Silver et al., 2018) for program synthesis is a single-player variant where
 the "game" is program construction.  The surface derivation game turns this into a
@@ -972,9 +1370,9 @@ violates most assumptions MCTS was designed for (Section 2 of the context docume
 
 ---
 
-## 13  Design Choices and Future Directions
+## 14  Design Choices and Future Directions
 
-### 13.1  Why sequence-only rule placement (the current "1a" design)
+### 14.1  Why sequence-only rule placement (the current "1a" design)
 
 The current surface derivation game is the **simplest possible** search over rule orderings:
 each step appends one pre-built rule to a flat list.  This was a deliberate choice:
@@ -986,7 +1384,7 @@ each step appends one pre-built rule to a flat list.  This was a deliberate choi
 - **Clean comparison baseline:** by holding rule templates fixed and varying only the
   ordering, we isolate the effect of ordering from the effect of rule structure.
 
-### 13.2  What the current design does NOT capture
+### 14.2  What the current design does NOT capture
 
 Each surface rule (e.g., `PickRule(k)`) is an **opaque atom** during search.  It bundles
 three logically separable decisions:
@@ -1012,7 +1410,7 @@ This matters because:
    stage-kind slots × guard choices × action choices — a finer-grained search space that
    admits different completion orders.
 
-### 13.3  Future direction: stage-skeleton with hole-selection policies
+### 14.3  Future direction: stage-skeleton with hole-selection policies
 
 The next step is to decompose each rule into **fillable slots** and study whether the order
 in which slots are filled affects search efficiency.
@@ -1054,7 +1452,104 @@ domain-informed order (stage-first or impact-first) materially improves search e
 
 ---
 
-## 14  File Reference
+## 15  Quick Start: Experimenting with the Surface DSL
+
+### 15.1  Minimal Python snippet
+
+The smallest self-contained experiment: build a stage program for D=2, compile it to an
+AST, run it on the Doors environment, and check if it solves.
+
+```python
+from alphazeropp.instances.doors.dsl.doors_config import (
+    DoorsGameConfig, doors_initial_state,
+)
+from alphazeropp.instances.doors.dsl.stage_dsl import Stage, StageProgram
+from alphazeropp.instances.doors.dsl.surface_dsl import (
+    PickReady, NeedKey, Pick, MoveToKey, MoveToGoal,
+)
+from alphazeropp.instances.doors.dsl.stage_compiler import compile_stage_program
+from alphazeropp.synthesis.interpreter import run_policy_episode
+
+# 1. Set up a D=2 Doors instance
+cfg = DoorsGameConfig(num_rooms=2, locs_per_room=2)
+
+# 2. Build a stage program (the canonical D=2 solver)
+prog = StageProgram(
+    stages=(
+        Stage(guard=PickReady(0), action=Pick(0)),
+        Stage(guard=NeedKey(0),   action=MoveToKey(0)),
+    ),
+    default_action=MoveToGoal(),
+)
+
+# 3. Compile to a raw AST
+ast = compile_stage_program(prog, cfg)
+print(ast.pretty())   # shows the nested Ite / Default tree
+
+# 4. Run on the environment
+x0  = doors_initial_state(cfg)
+env = cfg.make_env(cfg.obs_size(), frozen_states=[x0])
+result = run_policy_episode(env, ast, x0=x0, is_solved=cfg.is_solved)
+
+print(f"Solved: {result.solved}")
+print(f"Steps:  {result.total_env_steps}")
+print(f"Reward: {result.total_reward:.2f}")
+# Expected: Solved: True, Steps: 3, Reward: 1.07
+```
+
+### 15.2  Running the AlphaZero training loop
+
+The main training script uses MCTS + a neural network to *discover* solving orderings:
+
+```bash
+# Quick D=2 run (trivial — solves on iteration 1)
+python scripts/run_doors_stage_derivation.py --d 2 --non-interactive
+
+# D=3 with a specific seed
+python scripts/run_doors_stage_derivation.py --d 3 --seeds 42 --non-interactive
+
+# D=8 (the transition zone — still solves, takes a few iterations)
+python scripts/run_doors_stage_derivation.py --d 8 --non-interactive
+```
+
+Output goes to `experiments/doors_stage_derivation/{timestamp}_stage_D{D}_K{K}_*/`.
+Key files in the output directory:
+- `config.json` — full configuration snapshot
+- `training_metrics.png` — solve rate, reward, policy diversity over iterations
+- `program_log.jsonl` — best program found at each iteration
+
+### 15.3  Running tests as a sanity check
+
+```bash
+# Stage DSL: compiler, grammar, cost model
+pytest tests/test_stage_dsl.py -v
+
+# Stage derivation game: action space, legal masks, episodes
+pytest tests/test_stage_derivation_game.py -v
+
+# Reactive sketch: permutation sweep, equivalence classes
+pytest tests/test_reactive_sketch.py -v
+```
+
+### 15.4  Key configuration knobs
+
+The most important parameters in `stage_derivation_config.py`
+(`DoorsStageDerivationConfig`):
+
+| Parameter | Default | Effect |
+|---|---|---|
+| `num_rooms` | 3 | D — number of rooms.  K = D−1 keys, 2K+1 actions. |
+| `max_stages` | `None` (= 2K+1) | Max stages in the decision list. |
+| `max_guard_depth` | 0 | 0 = atom guards only; 1 = allows `Not`/`And` combinators. |
+| `hole_policy` | `"leftmost"` | Hole-filling order: `"leftmost"` or `"structure_first"`. |
+| `n_simulations` | 80 | MCTS simulations per move. Higher = stronger but slower. |
+| `n_games_per_train` | 30 | Self-play games per training iteration. |
+| `n_iterations` | 30 | Number of train→play→evaluate cycles. |
+| `n_procs` | 8 | Parallel self-play workers. |
+
+---
+
+## 16  File Reference
 
 | File | Role |
 |---|---|
@@ -1070,3 +1565,5 @@ domain-informed order (stage-first or impact-first) materially improves search e
 | `tests/test_surface_vs_direct_smoke.py` | Agent integration smoke tests |
 | `scripts/run_surface_mini_sweep.py` | Mini sweep across D values (Section 11) |
 | `scripts/run_surface_vs_direct.py` | Surface vs direct comparison harness |
+| `src/.../dsl/reactive_sketch_dsl.py` | Reactive sketch DSL: lifted BT representation (Section 12) |
+| `src/.../dsl/reactive_sketch_interpreter.py` | Tick-based interpreter for reactive sketch |
