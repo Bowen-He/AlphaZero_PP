@@ -75,6 +75,7 @@ class LeafEvaluator:
         self._cache: dict[str, float] = {}
         self._full_cache: dict[str, dict] = {}
         self._program_cache: dict[str, Program] = {}
+        self._surface_labels: dict[str, str] = {}  # AST key → surface pretty
 
         # Statistics
         self._eval_count = 0
@@ -145,6 +146,7 @@ class LeafEvaluator:
             "_cache": dict(self._cache),
             "_full_cache": dict(self._full_cache),
             "_program_cache": dict(self._program_cache),
+            "_surface_labels": dict(self._surface_labels),
             "_eval_count": self._eval_count - self._base_eval_count,
             "_cache_hits": self._cache_hits - self._base_cache_hits,
             "_total_env_steps": self._total_env_steps - self._base_total_env_steps,
@@ -163,6 +165,9 @@ class LeafEvaluator:
                 self._cache[key] = value
                 self._full_cache[key] = other["_full_cache"][key]
                 self._program_cache[key] = other["_program_cache"][key]
+        for key, label in other.get("_surface_labels", {}).items():
+            if key not in self._surface_labels:
+                self._surface_labels[key] = label
         self._eval_count += other.get("_eval_count", 0)
         self._cache_hits += other.get("_cache_hits", 0)
         self._total_env_steps += other.get("_total_env_steps", 0)
@@ -194,6 +199,7 @@ class LeafEvaluator:
         state['_cache'] = {}
         state['_full_cache'] = {}
         state['_program_cache'] = {}
+        state['_surface_labels'] = {}
         state['_eval_count'] = 0
         state['_cache_hits'] = 0
         state['_total_env_steps'] = 0

@@ -15,6 +15,8 @@ _MODE_LABELS = {
     "doors_no_and": "Flat (no And)",
     "doors_factored": "Factored",
     "doors_d10_macro": "Macro",
+    "reactive": "Reactive BT",
+    "surface": "Surface Rules",
 }
 
 
@@ -75,8 +77,9 @@ def extract_best_program(leaf_eval):
     if not leaf_eval._cache:
         return None, None, None, float("-inf")
     best_key = max(leaf_eval._cache, key=leaf_eval._cache.get)
+    display_key = leaf_eval._surface_labels.get(best_key, best_key)
     return (
-        best_key,
+        display_key,
         leaf_eval._program_cache[best_key],
         leaf_eval._full_cache[best_key],
         leaf_eval._cache[best_key],
@@ -85,10 +88,6 @@ def extract_best_program(leaf_eval):
 
 def print_best_program_traces(program, metrics, leaf_eval, max_traces=5):
     """Show the best program and step-by-step traces on frozen states."""
-    from alphazeropp.synthesis.interpreter import (
-        run_policy_episode, format_trace,
-    )
-
     n_sites = leaf_eval.n_sites
     n_episodes = metrics.get("n_episodes", 1)
     sr = metrics.get("solve_rate", 0)
@@ -131,6 +130,27 @@ def print_best_program_traces(program, metrics, leaf_eval, max_traces=5):
           f"state{'s' if n_to_show != 1 else ''}:")
     print("-" * 80)
 
+    # Detect reactive BT policies vs AST programs
+    _is_reactive = hasattr(program, "bt_root")
+
+    if _is_reactive:
+        _print_reactive_traces(program, leaf_eval, frozen_states,
+                               n_to_show, max_traces)
+    else:
+        _print_ast_traces(program, leaf_eval, frozen_states,
+                          n_to_show, max_traces)
+
+    print("=" * 80)
+    print()
+
+
+def _print_ast_traces(program, leaf_eval, frozen_states, n_to_show, max_traces):
+    """Print step-by-step traces using the AST interpreter."""
+    from alphazeropp.synthesis.interpreter import (
+        run_policy_episode, format_trace,
+    )
+    n_sites = leaf_eval.n_sites
+
     for i, x0 in enumerate(frozen_states[:n_to_show]):
         env = leaf_eval.game_config.make_env(n_sites, frozen_states=[x0])
         env.reset()
@@ -138,10 +158,8 @@ def print_best_program_traces(program, metrics, leaf_eval, max_traces=5):
                                            is_solved=leaf_eval.is_solved)
 
         if i == 0:
-            # Full trace for the first state
             print(format_trace(result, program=program))
         else:
-            # Compact summary for subsequent states
             state_str = "[" + ", ".join(str(int(b)) for b in x0) + "]"
             status = "SOLVED" if result.solved else "NOT SOLVED"
             print(f"  {state_str} -> {status} "
@@ -152,8 +170,46 @@ def print_best_program_traces(program, metrics, leaf_eval, max_traces=5):
         print(f"  ... and {len(frozen_states) - max_traces} more states "
               f"(not shown)")
 
-    print("=" * 80)
-    print()
+
+def _print_reactive_traces(program, leaf_eval, frozen_states,
+                           n_to_show, max_traces):
+    """Print step-by-step traces using the reactive BT tick interpreter."""
+    from alphazeropp.instances.doors.dsl.reactive_sketch_interpreter import (
+        run_reactive_episode,
+    )
+    from alphazeropp.instances.doors.dsl.relational_runtime import (
+        DoorsRelationalRuntime,
+    )
+    n_sites = leaf_eval.n_sites
+    rt = DoorsRelationalRuntime(leaf_eval.game_config)
+
+    for i, x0 in enumerate(frozen_states[:n_to_show]):
+        env = leaf_eval.game_config.make_env(n_sites, frozen_states=[x0])
+        result = run_reactive_episode(
+            env, program.bt_root, rt, x0=x0,
+            is_solved=leaf_eval.is_solved,
+        )
+
+        if i == 0:
+            # Full trace for reactive policy
+            print(f"  Initial state: [{', '.join(str(int(b)) for b in x0)}]")
+            for step in result.steps:
+                trace_str = step.rule_trace[0] if step.rule_trace else f"action={step.action}"
+                print(f"    step {step.step_num}: {trace_str} "
+                      f"(reward={step.reward:+.4f})")
+            status = "SOLVED" if result.solved else "NOT SOLVED"
+            print(f"  Result: {status} in {result.total_env_steps} steps, "
+                  f"reward={result.cumulative_reward:+.4f}")
+        else:
+            state_str = "[" + ", ".join(str(int(b)) for b in x0) + "]"
+            status = "SOLVED" if result.solved else "NOT SOLVED"
+            print(f"  {state_str} -> {status} "
+                  f"in {result.total_env_steps} steps, "
+                  f"reward={result.cumulative_reward:+.4f}")
+
+    if len(frozen_states) > max_traces:
+        print(f"  ... and {len(frozen_states) - max_traces} more states "
+              f"(not shown)")
 
 
 def rename_plot_with_stats(cfg, trainer_stats, evaluator_stats, best_metrics):
